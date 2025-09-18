@@ -1,9 +1,19 @@
 # ---------------------------------------------------------------------------
-#dbelt_full.py  ——  DUET-L (CIFAR) 单文件实现  •  PyTorch ≥ 2.1
-# This code contains the main program and complete theoretical framework. If you need other code of evaluation index and comparison method\ ablation experimental switch\ parameter sensitivity study, please supplement it yourself
+# 8.17duetl_full.py  ——  DUET-L (CIFAR) 单文件实现  •  PyTorch ≥ 2.1
 #
-# 运行示例：#D:duel-env\Scripts\Activate.ps1
-#   python D:CIFAR\duetl_cifar10_lt_opt.py  --datapath D:\appp\DUELT\CIFAR\data --lt_dir  D:\appp\DUELT\CIFAR\data\cifar-10-LT-10 --epochs 300 --batch_size 256 --lr 0.2 --num_classes 10 --K 4 --N_bar 2 --lambda_rs 0.9 --lambda_bt 0.1 --use_load_balance ture --lambda_M 0.1 --amp false --gpu 0 --seed 42
+# 支持功能：
+#   1. 共享 ResNet-18 骨干 + 双分支多专家
+#   2. 轻探针熵 + 批中位数  →  动态专家数 N_exp(x)
+#   3. 差异①：多样性贪婪选专家（永久启用）
+#   4. 差异②：MoE 负载均衡正则 L_MoE（use_load_balance / lambda_M 开关）
+#   5. R-branch 难例 × 尾类 × 熵 重采样 (λ_RS)
+#   6. Barlow Twins 去冗余
+#   7. 残差岭回归融合 (训练结束后一次性拟合 β=1.0；推理自动使用)
+#   8. Head / Mid / Tail Top-1 指标、TensorBoard 记录
+#
+# 运行示例：#D:\appp\DUELT\duel-env\Scripts\Activate.ps1
+#   python D:\appp\DUELT\CIFAR\duetl_cifar10_lt_opt.py  --datapath D:\appp\DUELT\CIFAR\data --lt_dir  D:\appp\DUELT\CIFAR\data\cifar-10-LT-10 --epochs 300 --batch_size 256 --lr 0.1 --num_classes 10 --K 4 --N_bar 2 --lambda_rs 0.3 --lambda_bt 0.06 --use_load_balance true --lambda_M 0.3 --amp false --gpu 0 --seed 42
+
 
 import os, argparse, tqdm, numpy as np, time
 from collections import defaultdict
@@ -19,8 +29,8 @@ from torchvision import datasets, transforms
 try:  import yaml
 except ImportError:  yaml = None
 try:
-    autocast = torch.amp.autocast        
-except AttributeError:                    
+    autocast = torch.amp.autocast          # 新推荐 API
+except AttributeError:                     # 老版本回退
     from torch.cuda.amp import autocast
 try:
     from tensorboardX import SummaryWriter
@@ -49,7 +59,7 @@ class CifarResNet18(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out')
 
     def _block(self, blk, planes, blocks, stride=1):
-
+        # --- 若通道/步幅变化，需要下采样支路 ---
         downsample = None
         if stride != 1 or self.inplanes != planes * blk.expansion:
             downsample = nn.Sequential(
@@ -308,7 +318,7 @@ def evaluate(model: DuetL, loader, seg_map, tb, ep, amp=False):
         for t, p in zip(y.cpu(), preds):
             per_cls[t.item()].append(int(t == p))
         # ---- 分段精度 ----
-
+    # ---- helper: segment指标 ----
     def seg_metrics(ids):
         mask = torch.isin(torch.cat(all_labels), torch.tensor(ids))
         if mask.sum() == 0:
@@ -398,7 +408,7 @@ def train(cfg):
             try: x_r,_=next(r_iter)
             except StopIteration: r_iter=iter(r_loader); x_r,_=next(r_iter)
             x_u,x_r,y = x_u.cuda(),x_r.cuda(),y.cuda()
-                        # ---------- AMP 前向（影响精度，可删） ----------
+                        # ---------- AMP 前向 ----------
             with autocast('cuda', enabled=cfg['amp']):
                 loss = model(
                     x_u, x_r,
