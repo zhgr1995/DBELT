@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# 8.17duetl_full.py  ——  DUET-L (CIFAR) 单文件实现  •  PyTorch ≥ 2.1
+# 8.17duetl_full.py  ——  DUET-L (CIFAR)  •  PyTorch ≥ 2.1
 #
 # 支持功能：
 #   1. 共享 ResNet-18 骨干 + 双分支多专家
@@ -29,8 +29,8 @@ from torchvision import datasets, transforms
 try:  import yaml
 except ImportError:  yaml = None
 try:
-    autocast = torch.amp.autocast          # 新推荐 API
-except AttributeError:                     # 老版本回退
+    autocast = torch.amp.autocast         
+except AttributeError:                    
     from torch.cuda.amp import autocast
 try:
     from tensorboardX import SummaryWriter
@@ -59,7 +59,6 @@ class CifarResNet18(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out')
 
     def _block(self, blk, planes, blocks, stride=1):
-        # --- 若通道/步幅变化，需要下采样支路 ---
         downsample = None
         if stride != 1 or self.inplanes != planes * blk.expansion:
             downsample = nn.Sequential(
@@ -101,7 +100,7 @@ def greedy_diverse_select(probs: torch.Tensor, n: int) -> torch.Tensor:
         remain = (~sel).nonzero(as_tuple=False).squeeze(1)
         cand   = probs[remain]            # [r,C]
         sel_vec= probs[sel]               # [s,C]
-        # 每候选与已选最大余弦相似度 → 1-sim 为距离
+      
         dist = 1 - F.cosine_similarity(cand.unsqueeze(1), sel_vec.unsqueeze(0), dim=-1).max(1).values
         sel[remain[torch.argmax(dist)]] = True
     return sel
@@ -157,9 +156,9 @@ class DuetL(nn.Module):
         z = self.backbone(x)
         log_u, _ = self.u(z, torch.full((x.size(0),), self.N_bar, device=x.device))
         log_r, _ = self.r(z, torch.full_like(log_u[:, 0], self.N_bar))
-        if hasattr(self, "W_fus"):  # 已拟合融合权重
+        if hasattr(self, "W_fus"): 
             logits = torch.cat([log_u, log_r], 1) @ self.W_fus.t()
-        else:                       # 默认 0.5 均值
+        else:                       
             logits = 0.5 * (log_u + log_r)
         return logits
 
@@ -172,7 +171,7 @@ class DuetL(nn.Module):
         log_u, g_u = self.u(z_u, n_u)
         log_r, g_r = self.r(z_r, n_r)
 
-        if cfg is None:            # 推理阶段（不计算损失）
+        if cfg is None:           
             return log_u, log_r
 
         y = cfg['target']
@@ -208,8 +207,7 @@ class DifficultySampler(Sampler):
         q = self.base * ce_hist * (1. + entropy)
         s = q.sum()
         if s <= 0 or np.isnan(s):
-            # 回退到均匀分布，避免 NaN
-            self.p = self.uniform.copy()
+                self.p = self.uniform.copy()
             return
         q /= s
         self.p = (1 - self.lambda_rs) * self.uniform + self.lambda_rs * q
@@ -249,9 +247,9 @@ def cifar_loaders(cfg):
 
     Data = datasets.CIFAR10 if cfg['dataset'] == 'cifar10' else datasets.CIFAR100
     # ----- 读取长尾索引 -----
-    if cfg.get('lt_dir'):                          # 用户显式给路径
+    if cfg.get('lt_dir'):                     
         lt_root = cfg['lt_dir']
-    else:                                          # 按 dataset 推断默认 cifar-10-LT-10
+    else:                                          
         lt_root = os.path.join(cfg['datapath'],
                                f"{'cifar-10' if cfg['dataset']=='cifar10' else 'cifar-100'}-LT-10")
 
@@ -266,7 +264,7 @@ def cifar_loaders(cfg):
     train_set  = torch.utils.data.Subset(full_train, idx)
     val_set   = Data(cfg['datapath'], False, download=True, transform=T_test)
     if isinstance(train_set, torch.utils.data.Subset):
-        # 从原始数据集拿 targets，再按 indices 子集化
+
         full_labels = np.array(train_set.dataset.targets)
         labels = full_labels[train_set.indices]
     else:
@@ -289,7 +287,7 @@ def fit_ridge_fusion(model: DuetL, loader: DataLoader, beta: float = 1.0):
     model.eval(); X, Y = [], []
     for x, y in loader:
         x, y = x.cuda(), y.cuda()
-        log_u, log_r = model(x, x)           # 仅前向，无损失
+        log_u, log_r = model(x, x)    
         X.append(torch.cat([log_u, log_r], 1).cpu())
         Y.append(F.one_hot(y, num_classes=log_u.size(1)).float().cpu())
     X = torch.cat(X).numpy(); Y = torch.cat(Y).numpy()
@@ -331,7 +329,7 @@ def evaluate(model: DuetL, loader, seg_map, tb, ep, amp=False):
                 y_seg.numpy(), F.softmax(p_seg, -1).numpy(),
                 multi_class='ovr', average='macro')
         except ValueError:
-            auc = float('nan')     # 用 nan 占位
+            auc = float('nan')    
         f1 = f1_score(y_seg.numpy(), p_seg.argmax(1).numpy(), average='macro')
         # ---------- gmean ----------
         cm = confusion_matrix(y_seg, p_seg.argmax(1), labels=ids)
@@ -386,7 +384,7 @@ def evaluate(model: DuetL, loader, seg_map, tb, ep, amp=False):
 def train(cfg):
     torch.cuda.set_device(cfg.get('gpu', 0)); torch.backends.cudnn.benchmark = True
     # ========= ① 结果输出根目录 =========
-    # 若 CLI 指定了 --lt_dir，就把所有结果写到那个目录；否则仍用当前目录
+
     output_dir = pathlib.Path(cfg.get("lt_dir", "."))
     output_dir.mkdir(parents=True, exist_ok=True)   # 若不存在则创建
 
@@ -513,10 +511,10 @@ def write_result(cfg, metr, file_path='results.md'):
 # ---------------- 9. Main ----------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # 旧方式：配置文件（可选）
+
     parser.add_argument('--cfg', type=str, default=None,
                         help='可选：YAML 配置路径；若提供则忽略其它 CLI 超参')
-    # 新方式：纯 CLI 参数（当 --cfg 为空时生效）
+）
     parser.add_argument('--dataset', default='cifar10', choices=['cifar10','cifar100'])
     parser.add_argument('--datapath', required=False, default='./data')
     parser.add_argument('--lt_dir', type=str, default=None,
@@ -533,19 +531,18 @@ if __name__ == "__main__":
                         help='true/false')
     parser.add_argument('--lambda_M', type=float, default=0.01)
     parser.add_argument('--seed', type=int, default=42)
-    # 兼容你命令里带的 --gpu（脚本内部无需用到，接住即可）
+
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--amp', type=str, default='true',
                     help='开启自动混合精度 (AMP)')
     args = parser.parse_args()
 
-    # 如果提供了 --cfg，优先读取 YAML（保持后向兼容）
+
     if args.cfg is not None:
         if yaml is None:
             raise RuntimeError("未安装 PyYAML，无法解析 --cfg。可改用纯 CLI 方式或 pip install pyyaml。")
         cfg = yaml.safe_load(open(args.cfg, 'r', encoding='utf-8'))
     else:
-        # 纯 CLI 转成 dict
         cfg = {
             'dataset': args.dataset,
             'datapath': args.datapath,
@@ -564,4 +561,5 @@ if __name__ == "__main__":
             'amp': str(args.amp).lower() in ['true', '1', 'yes', 'y'],
         }
     train(cfg)
+
 
