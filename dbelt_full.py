@@ -146,7 +146,7 @@ class DuetL(nn.Module):
     # ---------------- 推理接口：自动使用 Ridge 融合 ------------------
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         """
-        推理阶段：与训练一致，先用 probe 估计熵，再决定每个样本的 N_exp(x)。
+        推理阶段：先用 probe 估计熵，再决定每个样本的 N_exp(x)。
         """
         z = self.backbone(x)   # [B, d]
         with torch.no_grad():
@@ -616,5 +616,6 @@ if __name__ == "__main__":
             'amp': str(args.amp).lower() in ['true', '1', 'yes', 'y'],
         }
     train(cfg)
+
 
 
