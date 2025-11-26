@@ -1,16 +1,6 @@
 # ---------------------------------------------------------------------------
 # 8.17duetl_full.py  ——  DUET-L (CIFAR)  •  PyTorch ≥ 2.1
 #
-# 支持功能：
-#   1. 共享 ResNet-18 骨干 + 双分支多专家
-#   2. 轻探针熵 + 批中位数  →  动态专家数 N_exp(x)
-#   3. 差异①：多样性贪婪选专家（永久启用）
-#   4. 差异②：MoE 负载均衡正则 L_MoE（use_load_balance / lambda_M 开关）
-#   5. R-branch 难例 × 尾类 × 熵 重采样 (λ_RS)
-#   6. Barlow Twins 去冗余
-#   7. 残差岭回归融合 (训练结束后一次性拟合 β=1.0；推理自动使用)
-#   8. Head / Mid / Tail Top-1 指标、TensorBoard 记录
-#
 # 运行示例：#D:\appp\DUELT\duel-env\Scripts\Activate.ps1
 #   python D:\appp\DUELT\CIFAR\duetl_cifar10_lt_opt.py  --datapath D:\appp\DUELT\CIFAR\data --lt_dir  D:\appp\DUELT\CIFAR\data\cifar-10-LT-10 --epochs 300 --batch_size 256 --lr 0.1 --num_classes 10 --K 4 --N_bar 2 --lambda_rs 0.3 --lambda_bt 0.06 --use_load_balance true --lambda_M 0.3 --amp false --gpu 0 --seed 42
 
@@ -145,49 +135,90 @@ class DuetL(nn.Module):
         self.r = Branch(self.backbone.out_dim, ncls, K)
 
     @staticmethod
-    def _entropy(p): return -(p * p.clamp_min(1e-9).log()).sum(-1)
+    def _entropy(p: torch.Tensor) -> torch.Tensor:
+            return -(p * p.clamp_min(1e-9).log()).sum(-1)
 
-    def _n_exp(self, H):
+    def _n_exp(self, H: torch.Tensor) -> torch.Tensor:
         tau = H.median()
-        return torch.where(H <= tau, self.N_bar, self.N_bar + 1)  # [2B]
+        # H 和返回值 shape 一致，元素 ∈ {N_bar, N_bar+1}
+        return torch.where(H <= tau, self.N_bar, self.N_bar + 1)
 
     # ---------------- 推理接口：自动使用 Ridge 融合 ------------------
     def predict(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.backbone(x)
-        log_u, _ = self.u(z, torch.full((x.size(0),), self.N_bar, device=x.device))
-        log_r, _ = self.r(z, torch.full_like(log_u[:, 0], self.N_bar))
-        if hasattr(self, "W_fus"): 
+        """
+        推理阶段：与训练一致，先用 probe 估计熵，再决定每个样本的 N_exp(x)。
+        """
+        z = self.backbone(x)   # [B, d]
+        with torch.no_grad():
+            logits_probe = self.probe(z)                      # [B, C]
+            p_probe = F.softmax(logits_probe, dim=-1)         # [B, C]
+            H = self._entropy(p_probe)                        # [B]
+            n_exp = self._n_exp(H)                            # [B]
+
+        log_u, _ = self.u(z, n_exp)
+        log_r, _ = self.r(z, n_exp)
+
+        if hasattr(self, "W_fus"):
             logits = torch.cat([log_u, log_r], 1) @ self.W_fus.t()
-        else:                       
+        else:
             logits = 0.5 * (log_u + log_r)
         return logits
 
     # ---------------- 前向：训练 & 返回 loss ----------------------
     def forward(self, x_u, x_r, cfg: Dict = None):
-        z_u, z_r = self.backbone(x_u), self.backbone(x_r)
-        H = self._entropy(F.softmax(self.probe(torch.cat([z_u, z_r], 0)), -1))
-        n_u, n_r = self._n_exp(H).split(z_u.size(0))
+        """
+        x_u, x_r : 两个 view（U-branch / R-branch）
+        cfg      : 训练配置字典，包含 target, lambda_bt, use_lb, lambda_M, lambda_probe 等
+        """
+        # 1) backbone 前向：对 backbone 正常回传梯度
+        z_u = self.backbone(x_u)   # [B, d]
+        z_r = self.backbone(x_r)   # [B, d]
 
-        log_u, g_u = self.u(z_u, n_u)
-        log_r, g_r = self.r(z_r, n_r)
+        # 2) probe：只用 detached 特征，不回传到 backbone
+        z_cat_det = torch.cat([z_u.detach(), z_r.detach()], dim=0)   # [2B, d]
+        logits_probe = self.probe(z_cat_det)                         # [2B, C]
+        p_probe = F.softmax(logits_probe, dim=-1)
+        H = self._entropy(p_probe)                                   # [2B]
+        n_u, n_r = self._n_exp(H).split(z_u.size(0))                 # [B], [B]
 
-        if cfg is None:           
+        # 3) 双分支多专家：N_exp(x) 由难度控制
+        log_u, g_u = self.u(z_u, n_u)   # [B,C], [B,K]
+        log_r, g_r = self.r(z_r, n_r)   # [B,C], [B,K]
+
+        if cfg is None:
+            
             return log_u, log_r
 
-        y = cfg['target']
+        y = cfg['target']                         # [B]
+        lambda_bt = cfg['lambda_bt']
+        use_lb    = cfg['use_lb']                 #
+        lambda_M  = cfg['lambda_M']
+        lambda_probe = cfg.get('lambda_probe', 0.0)
+
+        # 4) 分类主损失（两个分支）
         loss = F.cross_entropy(log_u, y) + F.cross_entropy(log_r, y)
 
-        # Barlow Twins
-        eps = 1e-6
-        zu = (z_u - z_u.mean(0)) / (z_u.std(0) + eps)
-        zr = (z_r - z_r.mean(0)) / (z_r.std(0) + eps)
-        c = (zu.T @ zr) / z_u.size(0)
-        on  = ((c.diag() - 1) ** 2).sum()
-        off = (c - torch.diag(c.diag())).pow(2).sum() - on
-        loss += cfg['lambda_bt'] * (on + 5e-3 * off)
+        # 5) probe 的监督损失
+        if lambda_probe > 0:
+            y_rep = torch.cat([y, y], dim=0)          # [2B]
+            loss_probe = F.cross_entropy(logits_probe, y_rep)
+            loss = loss + lambda_probe * loss_probe
 
-        if cfg['use_lb']:
-            loss += cfg['lambda_M'] * (load_balance_loss(g_u) + load_balance_loss(g_r))
+        # 6) Barlow Twins 去冗余：把跨分支相关性整体推向 0
+        eps = 1e-6
+        zu = (z_u - z_u.mean(0)) / (z_u.std(0) + eps)   # [B,d]
+        zr = (z_r - z_r.mean(0)) / (z_r.std(0) + eps)   # [B,d]
+        c  = (zu.T @ zr) / z_u.size(0)                  # [d,d]
+
+        # 理论版：对角 + 非对角都 → 0
+        on_diag  = (c.diag() ** 2).sum()
+        off_diag = (c - torch.diag(c.diag())).pow(2).sum()
+        loss = loss + lambda_bt * (on_diag + 5e-3 * off_diag)
+
+        # 7) MoE 负载均衡正则（两个分支）
+        if use_lb:
+            loss = loss + lambda_M * (load_balance_loss(g_u) + load_balance_loss(g_r))
+
         return loss
 
 # ---------------- 4. DifficultySampler --------------------------------------
@@ -203,11 +234,15 @@ class DifficultySampler(Sampler):
         self.uniform = np.ones(self.N) / self.N
         self.p = self.uniform.copy()
 
-    def update(self, ce_hist, entropy):
-        q = self.base * ce_hist * (1. + entropy)
+    def update(self, ce_hist: np.ndarray, entropy: np.ndarray):
+        """
+        ce_hist : 每个样本的 EMA 交叉熵 L_CE(x)
+        entropy : 每个样本的熵 H(x)
+        """
+        q = self.base * ce_hist * (1.0 + entropy)   # w_c^{-1} · CE · (1+H)
         s = q.sum()
         if s <= 0 or np.isnan(s):
-                self.p = self.uniform.copy()
+            self.p = self.uniform.copy()
             return
         q /= s
         self.p = (1 - self.lambda_rs) * self.uniform + self.lambda_rs * q
@@ -410,10 +445,13 @@ def train(cfg):
             with autocast('cuda', enabled=cfg['amp']):
                 loss = model(
                     x_u, x_r,
-                    dict(target=y,
-                         lambda_bt=cfg['lambda_bt'],
-                         use_lb=cfg['use_load_balance'],
-                         lambda_M=cfg['lambda_M'])
+                    dict(
+                        target=y,
+                        lambda_bt=cfg['lambda_bt'],
+                        use_lb=cfg['use_load_balance'],
+                        lambda_M=cfg['lambda_M'],
+                        lambda_probe=cfg.get('lambda_probe', 0.0),
+                    )
                 )
 
             scaler.scale(loss).backward()
@@ -428,20 +466,35 @@ def train(cfg):
         metr = evaluate(model, val_loader, seg_map, tb, ep, amp=cfg['amp'])
         write_csv(cfg | {"epochs": ep + 1}, metr, output_dir / "results.csv")
         write_result(cfg | {"epochs": ep + 1}, metr, output_dir / "results.md")
+
+        # --------- 根据 CE + 熵 更新 DifficultySampler ---------
         if cfg['lambda_rs'] > 0:
-            ce_epoch = np.zeros(len(labels))
-            entr_epoch = np.zeros(len(labels))
+            ce_epoch   = np.zeros(len(labels), dtype=np.float32)
+            entr_epoch = np.zeros(len(labels), dtype=np.float32)
+
+            model.eval()
             with torch.no_grad():
                 for idx, (img, lbl) in enumerate(u_loader.dataset):
                     img = img.unsqueeze(0).cuda()
-                    z   = model.backbone(img)
-                    p   = F.softmax(model.probe(z), -1).squeeze(0)
-                    entr_epoch[idx] = -(p * p.log()).sum().item()
-            # EMA 交叉熵：若首次则用熵近似
+                    lbl = torch.as_tensor([lbl], device=img.device)
+
+                    z = model.backbone(img)                  # [1,d]
+                    logits_probe = model.probe(z)           # [1,C]
+                    p = F.softmax(logits_probe, -1)[0]      # [C]
+
+                    # 熵 H(x)
+                    entr_epoch[idx] = (-(p * p.clamp_min(1e-9).log()).sum()).item()
+                    # 交叉熵 L_CE(x) = -log p_y
+                    ce_epoch[idx] = F.cross_entropy(logits_probe, lbl).item()
+
+            # EMA 累积 per-sample CE
             if not hasattr(diff_sp, 'ce_hist'):
-                diff_sp.ce_hist = entr_epoch.copy()
-            diff_sp.ce_hist = 0.9 * diff_sp.ce_hist + 0.1 * entr_epoch
+                diff_sp.ce_hist = ce_epoch.copy()
+            diff_sp.ce_hist = 0.9 * diff_sp.ce_hist + 0.1 * ce_epoch
+
+            # 用 CE_hist + 熵 更新采样分布
             diff_sp.update(diff_sp.ce_hist, entr_epoch)
+            model.train()
         if metr['tail_acc'] > best_tail:
             best_tail = metr['tail_acc']
             torch.save(model.state_dict(), output_dir / "best_tail.pth")
@@ -514,7 +567,6 @@ if __name__ == "__main__":
 
     parser.add_argument('--cfg', type=str, default=None,
                         help='可选：YAML 配置路径；若提供则忽略其它 CLI 超参')
-）
     parser.add_argument('--dataset', default='cifar10', choices=['cifar10','cifar100'])
     parser.add_argument('--datapath', required=False, default='./data')
     parser.add_argument('--lt_dir', type=str, default=None,
@@ -530,11 +582,13 @@ if __name__ == "__main__":
     parser.add_argument('--use_load_balance', type=str, default='false',
                         help='true/false')
     parser.add_argument('--lambda_M', type=float, default=0.01)
+    parser.add_argument('--lambda_probe', type=float, default=0.0,
+                        help='probe 的监督损失权重')
     parser.add_argument('--seed', type=int, default=42)
 
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--amp', type=str, default='true',
-                    help='开启自动混合精度 (AMP)')
+                        help='开启自动混合精度 (AMP)')
     args = parser.parse_args()
 
 
@@ -556,6 +610,7 @@ if __name__ == "__main__":
             'lambda_bt': args.lambda_bt,
             'use_load_balance': str(args.use_load_balance).lower() in ['true','1','yes','y'],
             'lambda_M': args.lambda_M,
+            'lambda_probe': args.lambda_probe,
             'seed': args.seed,
             'gpu': args.gpu,
             'amp': str(args.amp).lower() in ['true', '1', 'yes', 'y'],
