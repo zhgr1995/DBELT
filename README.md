@@ -94,9 +94,9 @@ DBELT 与多种代表性方法进行了对比，主要包括四类：
 
 所有实验均在一台**单机工作站**上完成：
 
-- GPU：NVIDIA GeForce **RTX 3060 (12 GB)**  
-- CPU：Intel **Core i5-12490F**  
-- 内存：32 GB  
+- GPU：NVIDIA GeForce **RTX 5090s (32 GB)**  
+- CPU：Intel **AMD 9950X**  
+- 内存：96 GB  
 - 软件环境：Python 3.12, PyTorch 2.1, CUDA 12.2, cuDNN 8.9  
 - 训练开启自动混合精度（AMP）
 
