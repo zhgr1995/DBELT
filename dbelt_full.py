@@ -130,11 +130,11 @@ class DuetL(nn.Module):
     def __init__(self, ncls=10, K=6, N_bar=3):
         super().__init__()
         self.backbone = CifarResNet18()
-        self.probe   = nn.Linear(self.backbone.out_dim, ncls)  # 轻探针
+        self.probe   = nn.Linear(self.backbone.out_dim, ncls)
         self.N_bar   = N_bar
         self.u = Branch(self.backbone.out_dim, ncls, K)
         self.r = Branch(self.backbone.out_dim, ncls, K)
-        self.tau_star = None 
+        self.register_buffer('tau_star', torch.tensor(0.0))  
         self.register_buffer('W_fus', None)
         
     @staticmethod
@@ -142,16 +142,14 @@ class DuetL(nn.Module):
             return -(p * p.clamp_min(1e-9).log()).sum(-1)
 
     def _n_exp(self, H: torch.Tensor) -> torch.Tensor:
-        # 训练时动态计算，推理时使用固定值
         if self.training:
             tau = H.median()
         else:
-            # 推理时使用预先计算的固定阈值
-            if self.tau_star is None:
+            if self.tau_star.item() > 0:  # ✓ 检查 tensor 值
+                tau = self.tau_star
+            else:
                 print("Warning: tau_star not set, using dynamic median")
                 tau = H.median()
-            else:
-                tau = self.tau_star
         return torch.where(H <= tau, self.N_bar, self.N_bar + 1)
 
     def set_tau_star(self, val_loader):
@@ -167,8 +165,8 @@ class DuetL(nn.Module):
                 H = self._entropy(p_probe)
                 all_entropy.append(H)
         all_entropy = torch.cat(all_entropy)
-        self.tau_star = all_entropy.median().item()
-        print(f"Set tau_star = {self.tau_star:.4f} from validation set")
+        self.tau_star = all_entropy.median()
+        print(f"Set tau_star = {self.tau_star.item():.4f} from validation set")
         
     # ---------------- 推理接口：自动使用 Ridge 融合 ------------------
     def predict(self, x: torch.Tensor) -> torch.Tensor:
@@ -351,7 +349,7 @@ def fit_ridge_fusion(model: DuetL, loader: DataLoader, beta: float = 1.0):
     model.eval(); X, Y = [], []
     for x, y in loader:
         x, y = x.cuda(), y.cuda()
-        log_u, log_r = model(x, x)    
+        log_u, log_r = model(x, x,  cfg=None)    
         X.append(torch.cat([log_u, log_r], 1).cpu())
         Y.append(F.one_hot(y, num_classes=log_u.size(1)).float().cpu())
     X = torch.cat(X).numpy(); Y = torch.cat(Y).numpy()
@@ -526,7 +524,12 @@ def train(cfg):
             model.train()
         if metr['tail_acc'] > best_tail:
             best_tail = metr['tail_acc']
-            torch.save(model.state_dict(), output_dir / "best_tail.pth")
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'epoch': ep,
+                'tail_acc': metr['tail_acc'],
+            }
+            torch.save(checkpoint, output_dir / "best_tail.pth")
         toc = time.time() - tic
         print(
             f"Epoch {ep+1}/{cfg['epochs']} | "
@@ -537,9 +540,19 @@ def train(cfg):
             f"T {fmt(metr['tail_acc'])}/{fmt(metr['tail_auc'])}/{fmt(metr['tail_gmean'])}/{fmt(metr['tail_f1'])} | "
             f"t {toc:.1f}s")
     
-    # -------- 训练结束：拟合 Ridge 融合权重 --------
+        # -------- 训练结束 --------
+    print(">> Setting tau_star from validation set...")
+    model.set_tau_star(val_loader)  # ✓ 添加
+    
+    print(">> Fitting Ridge fusion weights...")
     fit_ridge_fusion(model, val_loader)
-    torch.save(model.state_dict(), output_dir / "final.pth")
+    
+    # 保存完整模型
+    checkpoint = {
+        'model_state_dict': model.state_dict(),  # 包含 tau_star 和 W_fus
+        'config': cfg,
+    }
+    torch.save(checkpoint, output_dir / "final.pth")
     write_result(cfg, metr, file_path=output_dir / "results.md")
     write_csv(cfg, metr, file_path=output_dir / "results.csv")
     tb.close()
@@ -645,6 +658,7 @@ if __name__ == "__main__":
             'amp': str(args.amp).lower() in ['true', '1', 'yes', 'y'],
         }
     train(cfg)
+
 
 
 
