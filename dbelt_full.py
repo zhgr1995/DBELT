@@ -88,14 +88,15 @@ def greedy_diverse_select(probs: torch.Tensor, n: int) -> torch.Tensor:
     sel[torch.argmax(conf)] = True
     while sel.sum() < n:
         remain = (~sel).nonzero(as_tuple=False).squeeze(1)
-        cand   = probs[remain]            # [r,C]
-        sel_vec= probs[sel]               # [s,C]
-      
-        dist = 1 - F.cosine_similarity(cand.unsqueeze(1), sel_vec.unsqueeze(0), dim=-1).max(1).values
+        cand   = probs[remain]            # [r,C] 候选专家
+        sel_vec= probs[sel]               # [s,C] 当选专家
+        sim = F.cosine_similarity(cand.unsqueeze(1), sel_vec.unsqueeze(0), dim=-1)  # [r, s]
+        min_sim = sim.min(1).values  # min over selected
+        dist = 1 - min_sim
         sel[remain[torch.argmax(dist)]] = True
     return sel
 
-def load_balance_loss(gates: torch.Tensor):
+def L_MoE(gates: torch.Tensor):
     """MoE 负载均衡正则 (差异②)"""
     return ((gates.mean(0) - 1. / gates.size(1)) ** 2).sum()
 
@@ -133,16 +134,42 @@ class DuetL(nn.Module):
         self.N_bar   = N_bar
         self.u = Branch(self.backbone.out_dim, ncls, K)
         self.r = Branch(self.backbone.out_dim, ncls, K)
-
+        self.tau_star = None 
+        self.register_buffer('W_fus', None)
+        
     @staticmethod
     def _entropy(p: torch.Tensor) -> torch.Tensor:
             return -(p * p.clamp_min(1e-9).log()).sum(-1)
 
     def _n_exp(self, H: torch.Tensor) -> torch.Tensor:
-        tau = H.median()
-        # H 和返回值 shape 一致，元素 ∈ {N_bar, N_bar+1}
+        # 训练时动态计算，推理时使用固定值
+        if self.training:
+            tau = H.median()
+        else:
+            # 推理时使用预先计算的固定阈值
+            if self.tau_star is None:
+                print("Warning: tau_star not set, using dynamic median")
+                tau = H.median()
+            else:
+                tau = self.tau_star
         return torch.where(H <= tau, self.N_bar, self.N_bar + 1)
 
+    def set_tau_star(self, val_loader):
+        """在验证集上估计并设置固定阈值"""
+        self.eval()
+        all_entropy = []
+        with torch.no_grad():
+            for x, _ in val_loader:
+                x = x.cuda()
+                z = self.backbone(x)
+                logits_probe = self.probe(z)
+                p_probe = F.softmax(logits_probe, dim=-1)
+                H = self._entropy(p_probe)
+                all_entropy.append(H)
+        all_entropy = torch.cat(all_entropy)
+        self.tau_star = all_entropy.median().item()
+        print(f"Set tau_star = {self.tau_star:.4f} from validation set")
+        
     # ---------------- 推理接口：自动使用 Ridge 融合 ------------------
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -158,11 +185,12 @@ class DuetL(nn.Module):
         log_u, _ = self.u(z, n_exp)
         log_r, _ = self.r(z, n_exp)
 
-        if hasattr(self, "W_fus"):
+        if self.W_fus is not None:
             logits = torch.cat([log_u, log_r], 1) @ self.W_fus.t()
         else:
             logits = 0.5 * (log_u + log_r)
         return logits
+
 
     # ---------------- 前向：训练 & 返回 loss ----------------------
     def forward(self, x_u, x_r, cfg: Dict = None):
@@ -199,6 +227,7 @@ class DuetL(nn.Module):
         loss = F.cross_entropy(log_u, y) + F.cross_entropy(log_r, y)
 
         # 5) probe 的监督损失
+        lambda_probe = cfg.get('lambda_probe', 0.0)  # 默认值为 0
         if lambda_probe > 0:
             y_rep = torch.cat([y, y], dim=0)          # [2B]
             loss_probe = F.cross_entropy(logits_probe, y_rep)
@@ -213,11 +242,11 @@ class DuetL(nn.Module):
         # 理论版：对角 + 非对角都 → 0
         on_diag  = (c.diag() ** 2).sum()
         off_diag = (c - torch.diag(c.diag())).pow(2).sum()
-        loss = loss + lambda_bt * (on_diag + 5e-3 * off_diag)
+        loss = loss + lambda_bt * (on_diag + off_diag)
 
         # 7) MoE 负载均衡正则（两个分支）
         if use_lb:
-            loss = loss + lambda_M * (load_balance_loss(g_u) + load_balance_loss(g_r))
+            loss = loss + lambda_M * (L_MoE(g_u) + L_MoE(g_r))
 
         return loss
 
@@ -328,7 +357,7 @@ def fit_ridge_fusion(model: DuetL, loader: DataLoader, beta: float = 1.0):
     X = torch.cat(X).numpy(); Y = torch.cat(Y).numpy()
     coef = Ridge(alpha=beta, fit_intercept=False).fit(X, Y).coef_   # [C,2C]
     model.W_fus = torch.tensor(coef, dtype=torch.float32, device="cuda")
-    print(">> Ridge-fusion weights fitted.")
+    print(f">> Ridge-fusion weights fitted. Shape: {model.W_fus.shape}")
 
 # ---------------- 8. Train & Eval -------------------------------------------
 @torch.no_grad()
@@ -616,6 +645,7 @@ if __name__ == "__main__":
             'amp': str(args.amp).lower() in ['true', '1', 'yes', 'y'],
         }
     train(cfg)
+
 
 
 
