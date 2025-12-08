@@ -564,6 +564,7 @@ def train(cfg):
                 )
 
             scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             scaler.step(opt)
             scaler.update()
