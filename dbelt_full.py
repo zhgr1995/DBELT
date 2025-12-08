@@ -102,10 +102,10 @@ def L_MoE(gates: torch.Tensor):
 
 # ---------------- 3. Branch & DUET-L ----------------------------------------
 class Branch(nn.Module):
-    def __init__(self, d, ncls, K):
+    def __init__(self, d, ncls, K, T=2.0):
         super().__init__()
         self.experts = nn.ModuleList(ExpertHead(d, ncls) for _ in range(K))
-
+        self.T = T
     def forward(self, z: torch.Tensor, n_exp: torch.Tensor
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -121,37 +121,99 @@ class Branch(nn.Module):
         for b in range(B):
             mask = greedy_diverse_select(probs[b], n_exp[b].item())
             sel_conf = conf[b] * mask
-            w = F.softmax(sel_conf.masked_fill(~mask, -1e4) / 0.2, 0)
+            w = F.softmax(sel_conf.masked_fill(~mask, -1e4) / self.T, 0)
             gates[b] = w
         logits = (logits_all * gates.unsqueeze(-1)).sum(1)
         return logits, gates
 
 class DuetL(nn.Module):
-    def __init__(self, ncls=10, K=6, N_bar=3):
+    def __init__(self, ncls=10, K=6, N_bar=3, T=2.0):
         super().__init__()
-        self.backbone = CifarResNet18()
-        self.probe   = nn.Linear(self.backbone.out_dim, ncls)
-        self.N_bar   = N_bar
-        self.u = Branch(self.backbone.out_dim, ncls, K)
-        self.r = Branch(self.backbone.out_dim, ncls, K)
-        self.register_buffer('tau_star', torch.tensor(0.0))  
-        self.register_buffer('W_fus', None)
+        from torchvision.models.resnet import BasicBlock
+        
+        # 共享部分
+        self.inplanes = 64
+        self.shared_stem = nn.Sequential(
+            nn.Conv2d(3, 64, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        self.shared_layer1 = self._make_layer(BasicBlock, 64, 2, stride=1)
+        
+        # U-branch 独立部分
+        self.inplanes = 64  # 重置
+        self.u_layer2 = self._make_layer(BasicBlock, 128, 2, stride=2)
+        self.u_layer3 = self._make_layer(BasicBlock, 256, 2, stride=2)
+        self.u_layer4 = self._make_layer(BasicBlock, 512, 2, stride=2)
+        
+        # R-branch 独立部分
+        self.inplanes = 64  # 重置
+        self.r_layer2 = self._make_layer(BasicBlock, 128, 2, stride=2)
+        self.r_layer3 = self._make_layer(BasicBlock, 256, 2, stride=2)
+        self.r_layer4 = self._make_layer(BasicBlock, 512, 2, stride=2)
+        
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.out_dim = 512
+        
+        self.probe = nn.Linear(512, ncls)
+        self.N_bar = N_bar
+        self.K = K
+        self.u = Branch(512, ncls, K, T)
+        self.r = Branch(512, ncls, K, T)
+        self.register_buffer('tau_star', torch.tensor(0.0))
+        self.register_buffer('W_fus', torch.zeros(ncls, 2 * ncls))
+        
+        self._init_weights()
+    
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+        layers = [block(self.inplanes, planes, stride, downsample)]
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+        return nn.Sequential(*layers)
+    
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
         
     @staticmethod
     def _entropy(p: torch.Tensor) -> torch.Tensor:
             return -(p * p.clamp_min(1e-9).log()).sum(-1)
 
-    def _n_exp(self, H: torch.Tensor) -> torch.Tensor:
-        if self.training:
-            tau = H.median()
-        else:
-            if self.tau_star.item() > 0:  # ✓ 检查 tensor 值
-                tau = self.tau_star
-            else:
-                print("Warning: tau_star not set, using dynamic median")
-                tau = H.median()
-        return torch.where(H <= tau, self.N_bar, self.N_bar + 1)
+    def _n_exp(self, H: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
+        """论文Eq.5: N_exp(x) = N_bar if H(x)<=tau else N_bar+1"""
+        n = torch.where(H <= tau, self.N_bar, self.N_bar + 1)
+        return n.clamp(max=self.K)
 
+    def _forward_shared(self, x):
+        """共享部分前向"""
+        return self.shared_layer1(self.shared_stem(x))
+    
+    def _forward_u_branch(self, z_shared):
+        """U-branch高层特征"""
+        x = self.u_layer2(z_shared)
+        x = self.u_layer3(x)
+        x = self.u_layer4(x)
+        return self.avgpool(x).flatten(1)
+    
+    def _forward_r_branch(self, z_shared):
+        """R-branch高层特征"""
+        x = self.r_layer2(z_shared)
+        x = self.r_layer3(x)
+        x = self.r_layer4(x)
+        return self.avgpool(x).flatten(1)
+    
     def set_tau_star(self, val_loader):
         """在验证集上估计并设置固定阈值"""
         self.eval()
@@ -159,8 +221,9 @@ class DuetL(nn.Module):
         with torch.no_grad():
             for x, _ in val_loader:
                 x = x.cuda()
-                z = self.backbone(x)
-                logits_probe = self.probe(z)
+                z_shared = self._forward_shared(x)
+                z_u = self._forward_u_branch(z_shared)
+                logits_probe = self.probe(z_u)
                 p_probe = F.softmax(logits_probe, dim=-1)
                 H = self._entropy(p_probe)
                 all_entropy.append(H)
@@ -173,76 +236,87 @@ class DuetL(nn.Module):
         """
         推理阶段：先用 probe 估计熵，再决定每个样本的 N_exp(x)。
         """
-        z = self.backbone(x)   # [B, d]
+        z_shared = self._forward_shared(x)
+        z_u = self._forward_u_branch(z_shared)
+        z_r = self._forward_r_branch(z_shared)
+        
         with torch.no_grad():
-            logits_probe = self.probe(z)                      # [B, C]
-            p_probe = F.softmax(logits_probe, dim=-1)         # [B, C]
-            H = self._entropy(p_probe)                        # [B]
-            n_exp = self._n_exp(H)                            # [B]
+            logits_probe = self.probe(z_u.detach())
+            p_probe = F.softmax(logits_probe, dim=-1)
+            H = self._entropy(p_probe)
+            tau = self.tau_star if self.tau_star.item() > 0 else H.median()
+            n_exp = self._n_exp(H, tau)
 
-        log_u, _ = self.u(z, n_exp)
-        log_r, _ = self.r(z, n_exp)
+        log_u, _ = self.u(z_u, n_exp)
+        log_r, _ = self.r(z_r, n_exp)
 
-        if self.W_fus is not None:
+        if self.W_fus is not None and self.W_fus.abs().sum() > 0:
             logits = torch.cat([log_u, log_r], 1) @ self.W_fus.t()
         else:
             logits = 0.5 * (log_u + log_r)
         return logits
 
-
     # ---------------- 前向：训练 & 返回 loss ----------------------
-    def forward(self, x_u, x_r, cfg: Dict = None):
+    def forward(self, x: torch.Tensor, cfg: Dict = None):
         """
-        x_u, x_r : 两个 view（U-branch / R-branch）
-        cfg      : 训练配置字典，包含 target, lambda_bt, use_lb, lambda_M, lambda_probe 等
+        论文设计：单一输入x，两分支并行处理同一样本
+        x   : [B, 3, H, W] 输入图像
+        cfg : 训练配置字典
         """
-        # 1) backbone 前向：对 backbone 正常回传梯度
-        z_u = self.backbone(x_u)   # [B, d]
-        z_r = self.backbone(x_r)   # [B, d]
+        # 1) 共享低层特征
+        z_shared = self._forward_shared(x)
+        
+        # 2) 两分支独立高层特征
+        z_u = self._forward_u_branch(z_shared)  # [B, 512]
+        z_r = self._forward_r_branch(z_shared)  # [B, 512]
 
-        # 2) probe：只用 detached 特征，不回传到 backbone
-        z_cat_det = torch.cat([z_u.detach(), z_r.detach()], dim=0)   # [2B, d]
-        logits_probe = self.probe(z_cat_det)                         # [2B, C]
+        # 3) probe：只用 detached 特征，不回传到 backbone
+        z_probe = z_u.detach()
+        logits_probe = self.probe(z_probe)  # [B, C]
         p_probe = F.softmax(logits_probe, dim=-1)
-        H = self._entropy(p_probe)                                   # [2B]
-        n_u, n_r = self._n_exp(H).split(z_u.size(0))                 # [B], [B]
+        H = self._entropy(p_probe)  # [B]
+        
+        # 4) 计算tau和专家数量
+        if self.training:
+            tau = H.median()
+        else:
+            tau = self.tau_star if self.tau_star.item() > 0 else H.median()
+        n_exp = self._n_exp(H, tau)  # [B]
 
-        # 3) 双分支多专家：N_exp(x) 由难度控制
-        log_u, g_u = self.u(z_u, n_u)   # [B,C], [B,K]
-        log_r, g_r = self.r(z_r, n_r)   # [B,C], [B,K]
+        # 5) 双分支多专家：两分支用同一个n_exp
+        log_u, g_u = self.u(z_u, n_exp)  # [B,C], [B,K]
+        log_r, g_r = self.r(z_r, n_exp)  # [B,C], [B,K]
 
         if cfg is None:
-            
-            return log_u, log_r
+            return log_u, log_r, z_u, z_r
 
-        y = cfg['target']                         # [B]
+        y = cfg['target']  # [B]
         lambda_bt = cfg['lambda_bt']
-        use_lb    = cfg['use_lb']                 #
-        lambda_M  = cfg['lambda_M']
-        lambda_probe = cfg.get('lambda_probe', 0.0)
+        use_lb = cfg['use_lb']
+        lambda_M = cfg['lambda_M']
+        lambda_probe = cfg.get('lambda_probe', 0.1)
 
-        # 4) 分类主损失（两个分支）
+        # 6) 分类主损失（两个分支）
         loss = F.cross_entropy(log_u, y) + F.cross_entropy(log_r, y)
 
-        # 5) probe 的监督损失
-        lambda_probe = cfg.get('lambda_probe', 0.0)  # 默认值为 0
+        # 7) probe 的监督损失 - 修正：维度匹配
         if lambda_probe > 0:
-            y_rep = torch.cat([y, y], dim=0)          # [2B]
-            loss_probe = F.cross_entropy(logits_probe, y_rep)
+            loss_probe = F.cross_entropy(logits_probe, y)  # [B,C] vs [B]
             loss = loss + lambda_probe * loss_probe
 
-        # 6) Barlow Twins 去冗余：把跨分支相关性整体推向 0
+        # 8) Barlow Twins 去冗余
         eps = 1e-6
-        zu = (z_u - z_u.mean(0)) / (z_u.std(0) + eps)   # [B,d]
-        zr = (z_r - z_r.mean(0)) / (z_r.std(0) + eps)   # [B,d]
-        c  = (zu.T @ zr) / z_u.size(0)                  # [d,d]
+        h_u = (z_u - z_u.mean(0)) / (z_u.std(0) + eps)
+        h_r = (z_r - z_r.mean(0)) / (z_r.std(0) + eps)
+        C = (h_u.T @ h_r) / z_u.size(0)
 
-        # 理论版：对角 + 非对角都 → 0
-        on_diag  = (c.diag() ** 2).sum()
-        off_diag = (c - torch.diag(c.diag())).pow(2).sum()
-        loss = loss + lambda_bt * (on_diag + off_diag)
+        theta_bt = cfg.get('theta_bt', 1.0)
+        on_diag = (C.diag() ** 2).sum()
+        off_diag_mask = ~torch.eye(C.size(0), dtype=torch.bool, device=C.device)
+        off_diag = (C[off_diag_mask] ** 2).sum()
+        loss = loss + lambda_bt * (on_diag + theta_bt * off_diag)
 
-        # 7) MoE 负载均衡正则（两个分支）
+        # 9) MoE 负载均衡正则
         if use_lb:
             loss = loss + lambda_M * (L_MoE(g_u) + L_MoE(g_r))
 
@@ -308,7 +382,7 @@ def cifar_loaders(cfg):
         transforms.Normalize((0.4914,0.4822,0.4465),(0.2023,0.1994,0.2010))])
 
     Data = datasets.CIFAR10 if cfg['dataset'] == 'cifar10' else datasets.CIFAR100
-    # ----- 读取长尾索引 -----
+    
     if cfg.get('lt_dir'):                     
         lt_root = cfg['lt_dir']
     else:                                          
@@ -325,35 +399,35 @@ def cifar_loaders(cfg):
     full_train = Data(cfg['datapath'], True, download=True, transform=T_train)
     train_set  = torch.utils.data.Subset(full_train, idx)
     val_set   = Data(cfg['datapath'], False, download=True, transform=T_test)
+    
     if isinstance(train_set, torch.utils.data.Subset):
-
         full_labels = np.array(train_set.dataset.targets)
         labels = full_labels[train_set.indices]
     else:
         labels = np.array(train_set.targets)
 
-    u_loader = DataLoader(train_set, cfg['batch_size'],
-                          sampler=RandomSampler(train_set),
-                          num_workers=6, pin_memory=True, drop_last=True)
+    # 使用难度感知采样器
     diff_sampler = DifficultySampler(labels, cfg['lambda_rs'])
-    r_loader = DataLoader(train_set, cfg['batch_size'],
-                          sampler=diff_sampler,
-                          num_workers=6, pin_memory=True, drop_last=True)
+    train_loader = DataLoader(train_set, cfg['batch_size'],
+                              sampler=diff_sampler,
+                              num_workers=4, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_set, cfg['batch_size'],
-                            shuffle=False, num_workers=6, pin_memory=True)
-    return u_loader, r_loader, val_loader, labels, diff_sampler
+                            shuffle=False, num_workers=4, pin_memory=True)
+    return train_loader, val_loader, labels, diff_sampler
 
 # ---------------- 7. Ridge Fusion 拟合 --------------------------------------
 @torch.no_grad()
 def fit_ridge_fusion(model: DuetL, loader: DataLoader, beta: float = 1.0):
-    model.eval(); X, Y = [], []
+    model.eval()
+    X, Y = [], []
     for x, y in loader:
         x, y = x.cuda(), y.cuda()
-        log_u, log_r = model(x, x,  cfg=None)    
+        log_u, log_r, _, _ = model(x, cfg=None)
         X.append(torch.cat([log_u, log_r], 1).cpu())
         Y.append(F.one_hot(y, num_classes=log_u.size(1)).float().cpu())
-    X = torch.cat(X).numpy(); Y = torch.cat(Y).numpy()
-    coef = Ridge(alpha=beta, fit_intercept=False).fit(X, Y).coef_   # [C,2C]
+    X = torch.cat(X).numpy()
+    Y = torch.cat(Y).numpy()
+    coef = Ridge(alpha=beta, fit_intercept=False).fit(X, Y).coef_
     model.W_fus = torch.tensor(coef, dtype=torch.float32, device="cuda")
     print(f">> Ridge-fusion weights fitted. Shape: {model.W_fus.shape}")
 
@@ -450,9 +524,9 @@ def train(cfg):
     output_dir = pathlib.Path(cfg.get("lt_dir", "."))
     output_dir.mkdir(parents=True, exist_ok=True)   # 若不存在则创建
 
-    u_loader, r_loader, val_loader, labels, diff_sp = cifar_loaders(cfg)
+    train_loader, val_loader, labels, diff_sampler = cifar_loaders(cfg)
     seg_map = seg_split(labels)
-    model = DuetL(cfg['num_classes'], cfg['K'], cfg['N_bar']).cuda()
+    model = DuetL(cfg['num_classes'], cfg['K'], cfg['N_bar'], cfg.get('T', 2.0)).cuda()
     opt = torch.optim.SGD(model.parameters(), cfg['lr'], 0.9, weight_decay=5e-4)
     tb  = SummaryWriter(comment=cfg['dataset'])
     best_tail = 0.
@@ -462,22 +536,21 @@ def train(cfg):
         scaler = torch.cuda.amp.GradScaler(enabled=cfg['amp'])
     for ep in range(cfg['epochs']):
         tic = time.time()  
-        model.train(); meter=AverageMeter(); r_iter=iter(r_loader)
-        pbar = tqdm.tqdm(u_loader, desc=f'E{ep}')
-        for x_u, y in pbar:
-            try: x_r,_=next(r_iter)
-            except StopIteration: r_iter=iter(r_loader); x_r,_=next(r_iter)
-            x_u,x_r,y = x_u.cuda(),x_r.cuda(),y.cuda()
-                        # ---------- AMP 前向 ----------
+        model.train()
+        meter = AverageMeter()
+        pbar = tqdm.tqdm(train_loader, desc=f'E{ep}')
+        for x, y in pbar:
+            x, y = x.cuda(), y.cuda()
             with autocast('cuda', enabled=cfg['amp']):
                 loss = model(
-                    x_u, x_r,
+                    x,
                     dict(
                         target=y,
                         lambda_bt=cfg['lambda_bt'],
+                        theta_bt=cfg.get('theta_bt', 1.0),
                         use_lb=cfg['use_load_balance'],
                         lambda_M=cfg['lambda_M'],
-                        lambda_probe=cfg.get('lambda_probe', 0.0),
+                        lambda_probe=cfg.get('lambda_probe', 0.1),
                     )
                 )
 
@@ -487,7 +560,7 @@ def train(cfg):
             scaler.update()
             opt.zero_grad(set_to_none=True)
 
-            meter.update(loss.item(), x_u.size(0))
+            meter.update(loss.item(), x.size(0))
             pbar.set_postfix(loss=f'{meter.avg:.3f}')
         tb.add_scalar('train/loss', meter.avg, ep)
         metr = evaluate(model, val_loader, seg_map, tb, ep, amp=cfg['amp'])
@@ -501,26 +574,24 @@ def train(cfg):
 
             model.eval()
             with torch.no_grad():
-                for idx, (img, lbl) in enumerate(u_loader.dataset):
+                for idx in range(len(train_loader.dataset)):
+                    img, lbl = train_loader.dataset[idx]
                     img = img.unsqueeze(0).cuda()
                     lbl = torch.as_tensor([lbl], device=img.device)
 
-                    z = model.backbone(img)                  # [1,d]
-                    logits_probe = model.probe(z)           # [1,C]
-                    p = F.softmax(logits_probe, -1)[0]      # [C]
+                    z_shared = model._forward_shared(img)
+                    z_u = model._forward_u_branch(z_shared)
+                    logits_probe = model.probe(z_u)
+                    p = F.softmax(logits_probe, -1)[0]
 
-                    # 熵 H(x)
                     entr_epoch[idx] = (-(p * p.clamp_min(1e-9).log()).sum()).item()
-                    # 交叉熵 L_CE(x) = -log p_y
                     ce_epoch[idx] = F.cross_entropy(logits_probe, lbl).item()
 
             # EMA 累积 per-sample CE
-            if not hasattr(diff_sp, 'ce_hist'):
-                diff_sp.ce_hist = ce_epoch.copy()
-            diff_sp.ce_hist = 0.9 * diff_sp.ce_hist + 0.1 * ce_epoch
-
-            # 用 CE_hist + 熵 更新采样分布
-            diff_sp.update(diff_sp.ce_hist, entr_epoch)
+            if not hasattr(diff_sampler, 'ce_hist'):
+                diff_sampler.ce_hist = ce_epoch.copy()
+            diff_sampler.ce_hist = 0.9 * diff_sampler.ce_hist + 0.1 * ce_epoch
+            diff_sampler.update(diff_sampler.ce_hist, entr_epoch)
             model.train()
         if metr['tail_acc'] > best_tail:
             best_tail = metr['tail_acc']
@@ -624,8 +695,11 @@ if __name__ == "__main__":
     parser.add_argument('--use_load_balance', type=str, default='false',
                         help='true/false')
     parser.add_argument('--lambda_M', type=float, default=0.01)
-    parser.add_argument('--lambda_probe', type=float, default=0.0,
+    parser.add_argument('--lambda_probe', type=float, default=0.1,
                         help='probe 的监督损失权重')
+    parser.add_argument('--M', type=int, default=6)  # 与论文符号一致
+    parser.add_argument('--T', type=float, default=2.0)
+    parser.add_argument('--theta_bt', type=float, default=1.0)
     parser.add_argument('--seed', type=int, default=42)
 
     parser.add_argument('--gpu', type=int, default=0)
@@ -642,14 +716,17 @@ if __name__ == "__main__":
         cfg = {
             'dataset': args.dataset,
             'datapath': args.datapath,
+            'lt_dir': args.lt_dir,
             'epochs': args.epochs,
             'batch_size': args.batch_size,
             'lr': args.lr,
             'num_classes': args.num_classes,
             'K': args.K,
             'N_bar': args.N_bar,
+            'T': args.T,
             'lambda_rs': args.lambda_rs,
             'lambda_bt': args.lambda_bt,
+            'theta_bt': args.theta_bt,
             'use_load_balance': str(args.use_load_balance).lower() in ['true','1','yes','y'],
             'lambda_M': args.lambda_M,
             'lambda_probe': args.lambda_probe,
