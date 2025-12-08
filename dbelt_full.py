@@ -79,21 +79,20 @@ class ExpertHead(nn.Module):
 
 def greedy_diverse_select(probs: torch.Tensor, n: int) -> torch.Tensor:
     """
-    多样性贪婪选专家 (差异①)
+    多样性贪婪选专家 - 选择与已选专家最大相似度最小的候选
     probs: [K,C] softmax  → 返回 bool mask[K]
     """
     K = probs.size(0)
     conf = probs.max(-1).values   # [K]
     sel = torch.zeros(K, dtype=torch.bool, device=probs.device)
-    sel[torch.argmax(conf)] = True
+    sel[torch.argmax(conf)] = True  # 首先选最confident的
     while sel.sum() < n:
         remain = (~sel).nonzero(as_tuple=False).squeeze(1)
         cand   = probs[remain]            # [r,C] 候选专家
         sel_vec= probs[sel]               # [s,C] 当选专家
         sim = F.cosine_similarity(cand.unsqueeze(1), sel_vec.unsqueeze(0), dim=-1)  # [r, s]
-        min_sim = sim.min(1).values  # min over selected
-        dist = 1 - min_sim
-        sel[remain[torch.argmax(dist)]] = True
+        max_sim = sim.max(1).values  # ✅ 每个候选与已选专家的最大相似度
+        sel[remain[torch.argmin(max_sim)]] = True  # ✅ 选择max_sim最小的
     return sel
 
 def L_MoE(gates: torch.Tensor):
@@ -311,7 +310,7 @@ class DuetL(nn.Module):
         C = (h_u.T @ h_r) / z_u.size(0)
 
         theta_bt = cfg.get('theta_bt', 1.0)
-        on_diag = (C.diag() ** 2).sum()
+        on_diag = ((C.diag() -1 ) ** 2).sum()
         off_diag_mask = ~torch.eye(C.size(0), dtype=torch.bool, device=C.device)
         off_diag = (C[off_diag_mask] ** 2).sum()
         loss = loss + lambda_bt * (on_diag + theta_bt * off_diag)
@@ -468,9 +467,12 @@ def evaluate(model: DuetL, loader, seg_map, tb, ep, amp=False):
             auc = float('nan')    
         f1 = f1_score(y_seg.numpy(), p_seg.argmax(1).numpy(), average='macro')
         # ---------- gmean ----------
-        cm = confusion_matrix(y_seg, p_seg.argmax(1), labels=ids)
+        present_ids = np.intersect1d(ids, np.unique(y_seg.numpy()))
+        if len(present_ids) == 0:
+            return dict(acc=float('nan'), auc=None, gmean=float('nan'), f1=float('nan'))
+        cm = confusion_matrix(y_seg.numpy(), p_seg.argmax(1).numpy(), labels=present_ids)
         rec = np.diag(cm) / cm.sum(1).clip(min=1)
-        gmean = float(np.exp(np.log(np.clip(rec,1e-12,1)).mean()))
+        gmean = float(np.exp(np.log(np.clip(rec, 1e-12, 1)).mean()))
         return dict(acc=acc, auc=auc, gmean=gmean, f1=f1)
 
     head_m = seg_metrics(seg_map['head'])
@@ -518,6 +520,12 @@ def evaluate(model: DuetL, loader, seg_map, tb, ep, amp=False):
     return metr
 
 def train(cfg):
+    # 设置随机种子以确保可复现性
+    seed = cfg.get('seed', 42)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    
     torch.cuda.set_device(cfg.get('gpu', 0)); torch.backends.cudnn.benchmark = True
     # ========= ① 结果输出根目录 =========
 
@@ -528,6 +536,7 @@ def train(cfg):
     seg_map = seg_split(labels)
     model = DuetL(cfg['num_classes'], cfg['K'], cfg['N_bar'], cfg.get('T', 2.0)).cuda()
     opt = torch.optim.SGD(model.parameters(), cfg['lr'], 0.9, weight_decay=5e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg['epochs'])
     tb  = SummaryWriter(comment=cfg['dataset'])
     best_tail = 0.
     try:
@@ -601,6 +610,7 @@ def train(cfg):
                 'tail_acc': metr['tail_acc'],
             }
             torch.save(checkpoint, output_dir / "best_tail.pth")
+        scheduler.step()
         toc = time.time() - tic
         print(
             f"Epoch {ep+1}/{cfg['epochs']} | "
@@ -735,6 +745,7 @@ if __name__ == "__main__":
             'amp': str(args.amp).lower() in ['true', '1', 'yes', 'y'],
         }
     train(cfg)
+
 
 
 
