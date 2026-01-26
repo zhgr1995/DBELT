@@ -604,7 +604,7 @@ def compute_barlow_twins_loss(z_u: torch.Tensor, z_r: torch.Tensor,
     C = (h_u.T @ h_r) / z_u.size(0)
     
     # 【修正】对角线推向0（论文要求互补性）
-    on_diag = ((C.diag() - 1) ** 2).sum()
+    on_diag = (C.diag() ** 2).sum()
     
     # 非对角线推向0
     off_diag_mask = ~torch.eye(C.size(0), dtype=torch.bool, device=C.device)
